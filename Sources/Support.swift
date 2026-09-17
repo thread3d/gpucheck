@@ -118,6 +118,9 @@ enum Fmt {
 
     static func count(_ v: Double) -> String {
         let f = NumberFormatter()
+        // Fixed locale: mixing a "." grouping separator with "." decimal points
+        // elsewhere in the report is ambiguous.
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.numberStyle = .decimal
         f.maximumFractionDigits = 0
         return f.string(from: NSNumber(value: v)) ?? String(format: "%.0f", v)

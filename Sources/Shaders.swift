@@ -63,7 +63,9 @@ kernel void k_read(device const float4 *src [[buffer(0)]],
     out[gid] = acc.x + acc.y + acc.z + acc.w;
 }
 
-// 4 independent FMA chains x float4 = 16 FMAs (32 FLOP) per loop iteration.
+// 8 independent FMA chains x float4 = 32 FMAs (64 FLOP) per loop iteration.
+// Using 8 chains rather than 4 keeps enough work in flight that the loop is not
+// limited by instruction issue or FMA latency, so the number reflects the ALU.
 kernel void k_fma32(device float4 *out [[buffer(0)]],
                     constant uint &iters [[buffer(1)]],
                     uint gid [[thread_position_in_grid]]) {
@@ -72,13 +74,18 @@ kernel void k_fma32(device float4 *out [[buffer(0)]],
     float base = float(gid & 1023u) * 1.0e-3f;
     float4 c0 = float4(base, base + 0.1f, base + 0.2f, base + 0.3f);
     float4 c1 = c0 + 0.5f, c2 = c0 + 0.7f, c3 = c0 + 0.9f;
+    float4 c4 = c0 + 1.1f, c5 = c0 + 1.3f, c6 = c0 + 1.5f, c7 = c0 + 1.7f;
     for (uint i = 0; i < iters; ++i) {
         c0 = fma(a, c0, b);
         c1 = fma(a, c1, b);
         c2 = fma(a, c2, b);
         c3 = fma(a, c3, b);
+        c4 = fma(a, c4, b);
+        c5 = fma(a, c5, b);
+        c6 = fma(a, c6, b);
+        c7 = fma(a, c7, b);
     }
-    out[gid] = c0 + c1 + c2 + c3;
+    out[gid] = (c0 + c1) + (c2 + c3) + (c4 + c5) + (c6 + c7);
 }
 
 // mul + add + xor + shift on int4 = 16 integer ops per loop iteration.
@@ -151,6 +158,7 @@ let fp16ShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
+// 8 half4 chains = 32 lane-FMAs (64 FLOP) per loop iteration.
 kernel void k_fma16(device half4 *out [[buffer(0)]],
                     constant uint &iters [[buffer(1)]],
                     uint gid [[thread_position_in_grid]]) {
@@ -159,13 +167,18 @@ kernel void k_fma16(device half4 *out [[buffer(0)]],
     half base = half(gid & 1023u) * 1.0e-3h;
     half4 c0 = half4(base);
     half4 c1 = c0 + 0.1h, c2 = c0 + 0.2h, c3 = c0 + 0.3h;
+    half4 c4 = c0 + 0.4h, c5 = c0 + 0.5h, c6 = c0 + 0.6h, c7 = c0 + 0.7h;
     for (uint i = 0; i < iters; ++i) {
         c0 = fma(a, c0, b);
         c1 = fma(a, c1, b);
         c2 = fma(a, c2, b);
         c3 = fma(a, c3, b);
+        c4 = fma(a, c4, b);
+        c5 = fma(a, c5, b);
+        c6 = fma(a, c6, b);
+        c7 = fma(a, c7, b);
     }
-    out[gid] = c0 + c1 + c2 + c3;
+    out[gid] = (c0 + c1) + (c2 + c3) + (c4 + c5) + (c6 + c7);
 }
 
 kernel void k_half_scale(device const half *in [[buffer(0)]],

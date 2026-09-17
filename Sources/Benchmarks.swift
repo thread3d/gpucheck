@@ -113,10 +113,10 @@ final class Benchmarks {
         let specs: [ComputeSpec] = [
             ComputeSpec(function: "k_fma32", group: nil, name: "FP32 FMA", unit: "TFLOP/s",
                         threads: config.computeThreads, iters: config.computeIters,
-                        opsPerThreadIter: 32, bufferBytesPerThread: 16, kind: .fp32),
+                        opsPerThreadIter: 64, bufferBytesPerThread: 16, kind: .fp32),
             ComputeSpec(function: "k_fma16", group: "fp16", name: "FP16 FMA", unit: "TFLOP/s",
                         threads: config.computeThreads, iters: config.computeIters,
-                        opsPerThreadIter: 32, bufferBytesPerThread: 8, kind: .fp16),
+                        opsPerThreadIter: 64, bufferBytesPerThread: 8, kind: .fp16),
             ComputeSpec(function: "k_fma64", group: "fp64", name: "FP64 FMA", unit: "TFLOP/s",
                         threads: max(1 << 14, config.computeThreads / 4), iters: config.computeIters,
                         opsPerThreadIter: 8, bufferBytesPerThread: 8, kind: .fp64),
@@ -137,18 +137,24 @@ final class Benchmarks {
             let d = Dispatch(pipeline: p, buffers: [out], constantBytes: [(1, uintData([spec.iters]))],
                              threadgroups: gridSize(threads: spec.threads, threadsPerThreadgroup: 256),
                              threadsPerThreadgroup: tpg(256))
-            guard let t = try? ctx.bestTime(d, attempts: config.attempts) else { continue }
+            // Several dispatches per command buffer: a single dispatch of a
+            // short kernel is dominated by commit/wait overhead (~90 us here),
+            // which would understate throughput.
+            guard let t = try? ctx.bestTime(d, attempts: config.attempts, iterationsPerAttempt: 8) else { continue }
             let totalOps = Double(spec.threads) * Double(spec.iters) * spec.opsPerThreadIter
             let opsPerSecond = totalOps / t
             switch spec.kind {
             case .fp32:
                 let tflops = opsPerSecond / 1e12
                 var notes = ["\(Fmt.count(Double(spec.threads))) threads x \(spec.iters) iterations",
-                             "4 independent FMA chains; counted as 2 FLOP per FMA"]
+                             String(format: "each measured dispatch ran for %.3f ms", t * 1e3),
+                             "8 independent FMA chains; counted as 2 FLOP per FMA"]
                 if let peak = theoreticalFP32FLOPS {
                     let eff = opsPerSecond / peak * 100
                     notes.append(String(format: "theoretical peak from %d CUs @ %d MHz = %.2f TFLOP/s -> %.1f%% efficiency",
                                         openCLMatch?.computeUnits ?? 0, openCLMatch?.maxClockMHz ?? 0, peak / 1e12, eff))
+                    notes.append("the peak assumes the maximum boost clock, and at low intensity the workload may not "
+                                 + "fully saturate the GPU, so this ratio is a lower bound on real efficiency")
                     add("Compute", "FP32 peak (theoretical)", peak / 1e12, "TFLOP/s",
                         String(format: "%.2f TFLOP/s", peak / 1e12),
                         notes: ["CUs x 64 lanes x 2 FLOP x clock, using OpenCL-reported values"])
@@ -166,11 +172,13 @@ final class Benchmarks {
             case .fp16:
                 let tflops = opsPerSecond / 1e12
                 add("Compute", spec.name, tflops, spec.unit, String(format: "%.2f TFLOP/s", tflops),
-                    notes: ["half4 vectorised FMA, counted as 2 FLOP per lane-FMA"])
+                    notes: ["8 half4 chains, counted as 2 FLOP per lane-FMA",
+                            String(format: "each measured dispatch ran for %.3f ms", t * 1e3)])
             case .int32:
                 let tops = opsPerSecond / 1e12
                 add("Compute", spec.name, tops, spec.unit, String(format: "%.2f Tops/s", tops),
-                    notes: ["int4 mul+add+xor+shift = 16 integer ops per iteration"])
+                    notes: ["int4 mul+add+xor+shift = 16 integer ops per iteration",
+                            String(format: "each measured dispatch ran for %.3f ms", t * 1e3)])
             case .transcendental:
                 let gops = opsPerSecond / 1e9
                 add("Compute", spec.name, gops, spec.unit, String(format: "%.1f Gops/s", gops),
@@ -192,7 +200,7 @@ final class Benchmarks {
                              threadgroups: gridSize(threads: threads, threadsPerThreadgroup: size),
                              threadsPerThreadgroup: tpg(size))
             guard let t = try? ctx.bestTime(d, attempts: max(2, config.attempts / 2)) else { continue }
-            let flops = Double(threads) * Double(iters) * 32.0
+            let flops = Double(threads) * Double(iters) * 64.0
             curve.append((size, flops / t / 1e12))
         }
         guard let best = curve.max(by: { $0.1 < $1.1 }) else { return }
@@ -369,7 +377,7 @@ final class Benchmarks {
         let d = Dispatch(pipeline: p, buffers: [out], constantBytes: [(1, uintData([iters]))],
                          threadgroups: gridSize(threads: threads, threadsPerThreadgroup: 256),
                          threadsPerThreadgroup: tpg(256))
-        let flops = Double(threads) * Double(iters) * 32.0
+        let flops = Double(threads) * Double(iters) * 64.0
 
         var samples: [Double] = []
         let deadline = nowSeconds() + config.sustainedSeconds
@@ -479,10 +487,10 @@ enum MultiGPU {
         var outcome = ConcurrencyOutcome()
         guard contexts.count > 1 else { return outcome }
 
-        let threads = 1 << 20
-        let iters: UInt32 = 1024
-        let flops = Double(threads) * Double(iters) * 32.0
-        let bytes = min(config.bandwidthMB << 20, 256 << 20)
+        let threads = config.computeThreads
+        let iters: UInt32 = config.computeIters
+        let flops = Double(threads) * Double(iters) * 64.0
+        let bytes = min(config.bandwidthMB << 20, 128 << 20)
         let count = bytes / 16
 
         // Build per-device workloads.
