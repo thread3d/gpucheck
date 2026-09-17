@@ -6,32 +6,101 @@
 import Foundation
 import Metal
 
+/// How aggressive the suite is allowed to be.
+///
+/// GPU load on a machine that also drives its displays can starve WindowServer
+/// and hang the whole system, and a GPU with a history of driver resets can be
+/// pushed into one. `safe` is therefore the default: it still runs every
+/// correctness test and every benchmark, but with smaller workloads and a
+/// cooldown between tests so the compositor always gets the GPU back.
+enum Intensity: String {
+    case safe, normal, full
+
+    var cooldownMs: Int {
+        switch self {
+        case .safe: return 250
+        case .normal: return 120
+        case .full: return 60
+        }
+    }
+}
+
 struct SuiteConfig {
     var mode: String
+    var intensity: Intensity
     var attempts: Int
     var bandwidthMB: Int
+    var computeThreads: Int
+    var computeIters: UInt32
+    var cooldownMs: Int
     var sustainedSeconds: Double
     var concurrencySeconds: Double
+    var largeBufferBytes: Int
     var includeSustained: Bool
     var includeConcurrency: Bool
     var includeOpenCL: Bool
     var includeRender: Bool
+    var allowHeavy: Bool
 
-    static func make(mode: String) -> SuiteConfig {
+    /// `mode` sets the depth of the run; `intensity` caps how hard any single
+    /// workload may push the GPU. The two riskiest tests - a sustained
+    /// full-occupancy load and driving every GPU at once - additionally require
+    /// an explicit opt-in because they are what can hang a marginal system.
+    static func make(mode: String, intensity: Intensity, allowHeavy: Bool) -> SuiteConfig {
+        var attempts = 5
+        var bandwidthMB = 512
+        var threads = 1 << 20
+        var iters: UInt32 = 1024
+        var sustained: Double = 8
+        var concurrency: Double = 4
+        var largeBuffer = 2_684_354_560 // 2.5 GiB
+
         switch mode {
         case "quick":
-            return SuiteConfig(mode: mode, attempts: 3, bandwidthMB: 128, sustainedSeconds: 3,
-                               concurrencySeconds: 2, includeSustained: false, includeConcurrency: true,
-                               includeOpenCL: true, includeRender: true)
+            attempts = 3; bandwidthMB = 128; threads = 1 << 19; iters = 256
+            sustained = 3; concurrency = 2; largeBuffer = 1 << 30
         case "thorough":
-            return SuiteConfig(mode: mode, attempts: 8, bandwidthMB: 1024, sustainedSeconds: 20,
-                               concurrencySeconds: 8, includeSustained: true, includeConcurrency: true,
-                               includeOpenCL: true, includeRender: true)
+            attempts = 8; bandwidthMB = 1024; threads = 1 << 20; iters = 2048
+            sustained = 20; concurrency = 8
         default:
-            return SuiteConfig(mode: "standard", attempts: 5, bandwidthMB: 512, sustainedSeconds: 8,
-                               concurrencySeconds: 4, includeSustained: true, includeConcurrency: true,
-                               includeOpenCL: true, includeRender: true)
+            break
         }
+
+        // Intensity caps workload size regardless of the requested depth.
+        switch intensity {
+        case .safe:
+            bandwidthMB = min(bandwidthMB, 64)
+            threads = min(threads, 1 << 18)
+            iters = min(iters, 256)
+            sustained = 0
+            concurrency = 0
+            largeBuffer = 0
+        case .normal:
+            bandwidthMB = min(bandwidthMB, 256)
+            threads = min(threads, 1 << 19)
+            iters = min(iters, 512)
+            largeBuffer = min(largeBuffer, 1 << 30)
+        case .full:
+            break
+        }
+
+        return SuiteConfig(
+            mode: mode,
+            intensity: intensity,
+            attempts: attempts,
+            bandwidthMB: bandwidthMB,
+            computeThreads: threads,
+            computeIters: iters,
+            cooldownMs: intensity.cooldownMs,
+            sustainedSeconds: sustained,
+            concurrencySeconds: concurrency,
+            largeBufferBytes: largeBuffer,
+            includeSustained: sustained > 0 && allowHeavy,
+            includeConcurrency: concurrency > 0 && allowHeavy,
+            includeOpenCL: true,
+            includeRender: true,
+            allowHeavy: allowHeavy
+        )
     }
 }
 
@@ -814,9 +883,9 @@ final class FunctionalTests {
 
     func testLargeBuffer64BitAddressing() -> Check {
         let started = nowSeconds()
-        // 2.5 GiB: element indices stay under 2^31 but byte offsets cross 2^31,
-        // which is exactly where a 32-bit byte offset would break.
-        let targetBytes = 2_684_354_560
+        // Sized so byte offsets cross the 2^31 boundary, which is exactly where
+        // a 32-bit byte offset would break.
+        let targetBytes = config.largeBufferBytes
         let maxBytes = Int(ctx.device.maxBufferLength)
         guard targetBytes < maxBytes else {
             return Check(group: "Correctness", name: "64-bit addressing", status: .skipped,
@@ -1137,39 +1206,53 @@ final class FunctionalTests {
     func runAll(progress: Progress) -> [Check] {
         var checks: [Check] = []
 
-        func record(_ check: Check) {
+        // willRun() writes the step name to the journal before the GPU is
+        // touched, so a hang points at exactly one test.
+        func record(_ name: String, _ body: () -> Check) {
+            progress.willRun(name)
+            let check = body()
             progress.step(check.name, status: check.status, summary: check.summary, seconds: check.seconds)
             for d in check.details { progress.note(d) }
             checks.append(check)
+            rest(milliseconds: config.cooldownMs)
         }
 
         progress.beginPhase("Functional verification (compute)")
-        record(testResourceAllocation())
-        record(testBufferRoundTrip())
-        record(testSaxpy())
-        record(testThreadgroupReduction())
-        record(testAtomics())
-        record(testConcurrentQueues())
+        record("Memory allocation") { testResourceAllocation() }
+        record("Buffer round trip") { testBufferRoundTrip() }
+        record("SAXPY") { testSaxpy() }
+        record("Threadgroup reduction") { testThreadgroupReduction() }
+        record("Atomic operations") { testAtomics() }
+        record("Concurrent queues") { testConcurrentQueues() }
 
         progress.beginPhase("Numerical precision and math accuracy")
-        record(testHalfPrecision())
-        record(testDoublePrecision())
-        record(testMathAccuracy())
-        record(testFastMathAccuracy())
+        record("FP16 half precision") { testHalfPrecision() }
+        record("FP64 double precision") { testDoublePrecision() }
+        record("Math accuracy") { testMathAccuracy() }
+        record("Fast-math accuracy") { testFastMathAccuracy() }
 
         progress.beginPhase("Textures, blit and advanced resources")
-        record(testTextures())
-        record(testBlit())
-        record(testHeapAllocation())
-        record(testIndirectCommandBuffer())
-        record(testSimdMatrix())
-        record(testLargeBuffer64BitAddressing())
-        record(testTimestampCounters())
+        record("Texture read + filtering") { testTextures() }
+        record("Blit copy paths") { testBlit() }
+        record("Heap allocation") { testHeapAllocation() }
+        record("Indirect command buffer") { testIndirectCommandBuffer() }
+        record("SIMD group matrix") { testSimdMatrix() }
+        if config.largeBufferBytes > 0 {
+            record("64-bit addressing") { testLargeBuffer64BitAddressing() }
+        } else {
+            progress.willRun("64-bit addressing")
+            let skipped = Check(group: "Correctness", name: "64-bit addressing", status: .skipped,
+                                summary: "skipped at intensity '\(config.intensity.rawValue)'; use --intensity normal or --mode thorough to enable",
+                                details: ["this test allocates a multi-gigabyte buffer"])
+            progress.step(skipped.name, status: skipped.status, summary: skipped.summary)
+            checks.append(skipped)
+        }
+        record("GPU timestamp counters") { testTimestampCounters() }
 
         if config.includeRender {
             progress.beginPhase("Graphics pipeline")
-            record(testRenderPipeline())
-            record(testMSAA())
+            record("Render pipeline") { testRenderPipeline() }
+            record("MSAA resolve") { testMSAA() }
         }
 
         return checks

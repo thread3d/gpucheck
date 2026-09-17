@@ -524,3 +524,26 @@ func htmlReport(_ report: RunReport) -> String {
     html += "</div></body></html>"
     return html
 }
+
+// MARK: - Writing report files
+
+/// Writes JSON, Markdown and HTML reports to `outDir`, creating it if needed.
+/// Called after every completed device so partial results survive a hang.
+@discardableResult
+func writeReports(_ report: RunReport, to outDir: URL) throws -> [String] {
+    try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+    var written: [String] = []
+    if let json = jsonReport(report) {
+        let u = outDir.appendingPathComponent("gpucheck-report.json")
+        try json.write(to: u)
+        written.append(u.path)
+    }
+    let mdURL = outDir.appendingPathComponent("gpucheck-report.md")
+    try markdownReport(report).write(to: mdURL, atomically: true, encoding: .utf8)
+    written.append(mdURL.path)
+
+    let htmlURL = outDir.appendingPathComponent("gpucheck-report.html")
+    try htmlReport(report).write(to: htmlURL, atomically: true, encoding: .utf8)
+    written.append(htmlURL.path)
+    return written
+}

@@ -112,17 +112,23 @@ final class Benchmarks {
     func benchmarkCompute() {
         let specs: [ComputeSpec] = [
             ComputeSpec(function: "k_fma32", group: nil, name: "FP32 FMA", unit: "TFLOP/s",
-                        threads: 1 << 20, iters: 1024, opsPerThreadIter: 32, bufferBytesPerThread: 16, kind: .fp32),
+                        threads: config.computeThreads, iters: config.computeIters,
+                        opsPerThreadIter: 32, bufferBytesPerThread: 16, kind: .fp32),
             ComputeSpec(function: "k_fma16", group: "fp16", name: "FP16 FMA", unit: "TFLOP/s",
-                        threads: 1 << 20, iters: 1024, opsPerThreadIter: 32, bufferBytesPerThread: 8, kind: .fp16),
+                        threads: config.computeThreads, iters: config.computeIters,
+                        opsPerThreadIter: 32, bufferBytesPerThread: 8, kind: .fp16),
             ComputeSpec(function: "k_fma64", group: "fp64", name: "FP64 FMA", unit: "TFLOP/s",
-                        threads: 1 << 18, iters: 1024, opsPerThreadIter: 8, bufferBytesPerThread: 8, kind: .fp64),
+                        threads: max(1 << 14, config.computeThreads / 4), iters: config.computeIters,
+                        opsPerThreadIter: 8, bufferBytesPerThread: 8, kind: .fp64),
             ComputeSpec(function: "k_iops32", group: nil, name: "INT32 ALU", unit: "Tops/s",
-                        threads: 1 << 20, iters: 1024, opsPerThreadIter: 16, bufferBytesPerThread: 16, kind: .int32),
+                        threads: config.computeThreads, iters: config.computeIters,
+                        opsPerThreadIter: 16, bufferBytesPerThread: 16, kind: .int32),
             ComputeSpec(function: "k_sinf", group: nil, name: "sin() throughput", unit: "Gops/s",
-                        threads: 1 << 20, iters: 256, opsPerThreadIter: 4, bufferBytesPerThread: 16, kind: .transcendental),
+                        threads: config.computeThreads, iters: max(64, config.computeIters / 4),
+                        opsPerThreadIter: 4, bufferBytesPerThread: 16, kind: .transcendental),
             ComputeSpec(function: "k_sqrtf", group: nil, name: "sqrt() throughput", unit: "Gops/s",
-                        threads: 1 << 20, iters: 256, opsPerThreadIter: 4, bufferBytesPerThread: 16, kind: .transcendental),
+                        threads: config.computeThreads, iters: max(64, config.computeIters / 4),
+                        opsPerThreadIter: 4, bufferBytesPerThread: 16, kind: .transcendental),
         ]
 
         for spec in specs {
@@ -177,8 +183,8 @@ final class Benchmarks {
 
     func benchmarkOccupancy() {
         guard let p = try? ctx.pipeline("k_fma32") else { return }
-        let threads = 1 << 20
-        let iters: UInt32 = 512
+        let threads = config.computeThreads
+        let iters: UInt32 = max(64, config.computeIters / 2)
         guard let out = try? ctx.privateBuffer(bytes: threads * 16) else { return }
         var curve: [(Int, Double)] = []
         for size in [32, 64, 128, 256, 512, 1024] {
@@ -208,8 +214,8 @@ final class Benchmarks {
         desc.storageMode = .private
         guard let tex = ctx.device.makeTexture(descriptor: desc),
               let sampler = makeSampler(ctx.device, min: .linear, mag: .linear, address: .repeat) else { return }
-        let threads = 1 << 18
-        let iters: UInt32 = 512
+        let threads = config.computeThreads
+        let iters: UInt32 = max(32, config.computeIters / 4)
         guard let out = try? ctx.privateBuffer(bytes: threads * 16),
               let fill = try? ctx.pipeline("k_fill") else { return }
         // Populate the texture so sampling reads real data.
@@ -357,8 +363,8 @@ final class Benchmarks {
     func benchmarkSustained(progress: Progress) {
         guard config.includeSustained else { return }
         guard let p = try? ctx.pipeline("k_fma32") else { return }
-        let threads = 1 << 20
-        let iters: UInt32 = 1024
+        let threads = config.computeThreads
+        let iters: UInt32 = config.computeIters
         guard let out = try? ctx.privateBuffer(bytes: threads * 16) else { return }
         let d = Dispatch(pipeline: p, buffers: [out], constantBytes: [(1, uintData([iters]))],
                          threadgroups: gridSize(threads: threads, threadsPerThreadgroup: 256),
@@ -427,17 +433,32 @@ final class Benchmarks {
 
     func runAll(progress: Progress) {
         progress.beginPhase("Performance measurements")
-        benchmarkMemory()
-        benchmarkCompute()
-        benchmarkOccupancy()
-        benchmarkTextureSampling()
-        benchmarkLaunchOverhead()
-        benchmarkHostTransfer()
-        benchmarkOpenCL()
-        benchmarkSustained(progress: progress)
+
+        // Each group is journalled before it runs and followed by a cooldown so
+        // the display compositor regains the GPU between loads.
+        let steps: [(String, () -> Void)] = [
+            ("memory bandwidth", benchmarkMemory),
+            ("compute throughput", benchmarkCompute),
+            ("threadgroup size sweep", benchmarkOccupancy),
+            ("texture sampling", benchmarkTextureSampling),
+            ("dispatch latency", benchmarkLaunchOverhead),
+            ("host<->device transfer", benchmarkHostTransfer),
+            ("OpenCL cross-check", benchmarkOpenCL),
+        ]
+        for (name, body) in steps {
+            progress.willRun(name)
+            body()
+            progress.journal?.log("DONE   \(name)")
+            rest(milliseconds: config.cooldownMs)
+        }
+
+        if config.includeSustained {
+            progress.willRun("sustained load")
+            benchmarkSustained(progress: progress)
+            progress.journal?.log("DONE   sustained load")
+        }
     }
 }
-
 // MARK: - Multi-GPU concurrency
 
 struct ConcurrencyOutcome {

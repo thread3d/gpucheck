@@ -7,14 +7,22 @@ import OpenCL
 
 struct Options {
     var mode = "standard"
+    var intensity = Intensity.safe
+    var allowHeavy = false
     var outDir = "gpucheck-report"
     var deviceSelection: [Int] = []
+    var deviceIDSelection: [UInt64] = []
+    var deviceNameSelection: [String] = []
+    var skipDisplayGPUs = false
     var color = true
-    var includeOpenCL = true
-    var includeRender = true
+    var noOpenCL = false
+    var noRender = false
     var listOnly = false
+    var dryRun = false
     var sustainOverride: Double? = nil
     var bandwidthOverride: Int? = nil
+    var journalPath: String? = nil
+    var noJournal = false
 }
 
 let usage = """
@@ -23,19 +31,56 @@ gpucheck — comprehensive GPU test, verification and feature mapping
 USAGE
   gpucheck [options]
 
+SAFETY
+  This tool drives the GPUs hard. On a machine whose GPUs also drive the
+  displays, that can starve WindowServer and hang the whole system, and a GPU
+  with a history of driver resets can be pushed into one. The defaults are
+  therefore conservative: --intensity safe runs every correctness test and every
+  benchmark with reduced workloads and a cooldown between them, and skips the
+  two riskiest tests (sustained full-occupancy load and driving every GPU at
+  once). Those two require --allow-heavy.
+
+  Every step is written to a journal and fsync'd before the GPU is touched, and
+  reports are rewritten after each GPU completes, so if the machine does hang the
+  journal names the test that caused it and the partial report survives a reboot.
+
 OPTIONS
-  --mode quick|standard|thorough   Test depth. standard is the default.
-                                     quick    ~30 s, minimal sustained load
-                                     standard benchmarks + 8 s sustained per GPU
-                                     thorough more repetitions + 20 s sustained per GPU
+  --mode quick|standard|thorough   How deep the run goes. standard is default.
+  --intensity safe|normal|full     How hard any single workload may push the GPU.
+                                     safe (default)  small workloads, 250 ms cooldown,
+                                                     no sustained, no multi-GPU load,
+                                                     no multi-gigabyte allocations
+                                     normal          larger workloads, 120 ms cooldown
+                                     full            largest workloads, 60 ms cooldown
+  --allow-heavy                    Enable sustained-load and simultaneous all-GPU
+                                     tests. These are the tests most likely to hang
+                                     a marginal machine.
   --device N[,N...]                Only test the given (1-based) GPU indices.
-  --out DIR                        Directory for reports (default: gpucheck-report).
-  --bandwidth MB                   Working-set size for memory benchmarks.
-  --sustained SECONDS              Override the sustained-load duration per GPU.
+                                     NOTE: Metal device order is not stable across
+                                     reboots. Prefer --device-id for reproducible
+                                     runs.
+  --device-name TEXT[,TEXT...]     Only test GPUs whose name contains TEXT
+                                     (case-insensitive). GPU names are the only
+                                     identifier stable across reboots.
+  --device-id ID[,ID...]           Only test GPUs with the given Metal registry IDs
+                                     (see --list). Stable within a boot, but macOS
+                                     may renumber them after a reboot.
+  --skip-display-gpus              Skip GPUs that currently drive a display. This
+                                     is the lowest-risk way to exercise the machine,
+                                     because display GPUs are the ones whose load
+                                     can starve WindowServer.
+  --out DIR                        Report directory (default: gpucheck-report).
+  --journal FILE                   Journal path (default: <out>/gpucheck-journal.log).
+  --no-journal                     Do not write a journal.
+  --bandwidth MB                   Override the memory benchmark working set.
+  --sustained SECONDS              Override sustained duration (needs --allow-heavy).
   --no-opencl                      Skip the OpenCL cross-check.
   --no-render                      Skip graphics-pipeline tests.
   --no-color                       Disable ANSI colour.
   --list                           List detected GPUs and exit.
+  --dry-run                        Show the selected GPUs and the workload sizes
+                                     that would run, then exit without touching
+                                     the GPU.
   -h, --help                       Show this help.
 
 OUTPUT
@@ -60,13 +105,33 @@ func parseOptions(_ args: [String]) -> Options? {
                 print("error: unknown mode '\(v)'"); return nil
             }
             o.mode = v
+        case "--device-id":
+            guard let v = next(a) else { return nil }
+            for p in v.split(separator: ",").map(String.init) {
+                guard let n = UInt64(p) else { print("error: bad registry id '\(p)'"); return nil }
+                o.deviceIDSelection.append(n)
+            }
+        case "--device-name":
+            guard let v = next(a) else { return nil }
+            o.deviceNameSelection.append(contentsOf: v.split(separator: ",").map { String($0).lowercased() })
+        case "--skip-display-gpus": o.skipDisplayGPUs = true
+        case "--intensity":
+            guard let v = next(a) else { return nil }
+            guard let intensity = Intensity(rawValue: v) else {
+                print("error: unknown intensity '\(v)' (expected safe, normal or full)"); return nil
+            }
+            o.intensity = intensity
+        case "--allow-heavy": o.allowHeavy = true
         case "--out":
             guard let v = next(a) else { return nil }
             o.outDir = v
+        case "--journal":
+            guard let v = next(a) else { return nil }
+            o.journalPath = v
+        case "--no-journal": o.noJournal = true
         case "--device":
             guard let v = next(a) else { return nil }
-            let parts = v.split(separator: ",").map(String.init)
-            for p in parts {
+            for p in v.split(separator: ",").map(String.init) {
                 guard let n = Int(p), n > 0 else { print("error: bad device index '\(p)'"); return nil }
                 o.deviceSelection.append(n - 1)
             }
@@ -76,10 +141,11 @@ func parseOptions(_ args: [String]) -> Options? {
         case "--sustained":
             guard let v = next(a), let d = Double(v), d >= 0 else { print("error: bad --sustained value"); return nil }
             o.sustainOverride = d
-        case "--no-opencl": o.includeOpenCL = false
-        case "--no-render": o.includeRender = false
+        case "--no-opencl": o.noOpenCL = true
+        case "--no-render": o.noRender = true
         case "--no-color": o.color = false
         case "--list": o.listOnly = true
+        case "--dry-run": o.dryRun = true
         case "-h", "--help": print(usage); exit(0)
         default:
             print("error: unknown option '\(a)'\n")
@@ -94,10 +160,11 @@ func parseOptions(_ args: [String]) -> Options? {
 // MARK: - Entry point
 
 let rawArgs = Array(CommandLine.arguments.dropFirst())
-guard var options = parseOptions(rawArgs) else { exit(64) }
+guard let options = parseOptions(rawArgs) else { exit(64) }
 
 let console = Console(useColor: options.color && isatty(STDOUT_FILENO) == 1)
 let progress = Progress(console: console)
+let outDir = URL(fileURLWithPath: options.outDir)
 let runStart = nowSeconds()
 
 console.out("")
@@ -114,10 +181,27 @@ guard !allMetalDevices.isEmpty else {
     exit(1)
 }
 
-let selectedMetal: [MTLDevice]
-if options.deviceSelection.isEmpty {
-    selectedMetal = allMetalDevices
-} else {
+// Neither the device order nor the registry IDs survive a reboot, so matching on
+// the GPU name is the reproducible way to pick a device across sessions.
+let displayModels = displayAttachedGPUModels()
+
+var selectedMetal: [MTLDevice]
+if !options.deviceNameSelection.isEmpty {
+    selectedMetal = allMetalDevices.filter { d in
+        let name = d.name.lowercased()
+        return options.deviceNameSelection.contains { name.contains($0) }
+    }
+    if selectedMetal.isEmpty {
+        console.out(console.red("No GPU name matches '\(options.deviceNameSelection.joined(separator: ", "))'."))
+        exit(1)
+    }
+} else if !options.deviceIDSelection.isEmpty {
+    selectedMetal = allMetalDevices.filter { options.deviceIDSelection.contains($0.registryID) }
+    if selectedMetal.isEmpty {
+        console.out(console.red("No GPU matches registry id(s) \(options.deviceIDSelection.map(String.init).joined(separator: ", "))."))
+        exit(1)
+    }
+} else if !options.deviceSelection.isEmpty {
     selectedMetal = options.deviceSelection.compactMap { idx in
         (idx >= 0 && idx < allMetalDevices.count) ? allMetalDevices[idx] : nil
     }
@@ -125,11 +209,21 @@ if options.deviceSelection.isEmpty {
         console.out(console.red("No valid device indices; system has \(allMetalDevices.count) GPUs."))
         exit(1)
     }
+} else {
+    selectedMetal = allMetalDevices
 }
 
-// OpenCL cross-check enumeration (independent driver stack).
+if options.skipDisplayGPUs {
+    let kept = selectedMetal.filter { !displayModels.contains($0.name) }
+    if kept.isEmpty {
+        console.out(console.red("--skip-display-gpus would leave no GPUs to test (every detected GPU drives a display)."))
+        exit(1)
+    }
+    selectedMetal = kept
+}
+
 var openCLDevices: [OpenCLDevice] = []
-if options.includeOpenCL {
+if !options.noOpenCL {
     openCLDevices = enumerateOpenCLDevices()
 }
 
@@ -144,13 +238,14 @@ func matchOpenCL(_ metalName: String) -> OpenCLDevice? {
 if options.listOnly {
     console.out("")
     console.out(console.bold("Detected GPUs (\(allMetalDevices.count) Metal devices)"))
+    let displays = displayModels
     for (i, d) in allMetalDevices.enumerated() {
         let ocl = matchOpenCL(d.name)
         let cu = ocl.map { "\($0.computeUnits) CUs" } ?? "CUs n/a"
         let mem = ocl.map { Fmt.bytes($0.globalMemBytes) } ?? Fmt.bytes(d.recommendedMaxWorkingSetSize)
         let slot = d.location == .slot ? "slot \(d.locationNumber)" : locationName(d)
         console.out("  [\(i + 1)] \(d.name)")
-        console.out(console.grey("       \(slot) · \(mem) · \(cu) · Metal 3 \(d.supportsFamily(MTLGPUFamily(rawValue: 5001) ?? .common3) ? "yes" : "no")"))
+        console.out(console.grey("       registry \(d.registryID) · \(slot) · \(mem) · \(cu) · Metal 3 \(d.supportsFamily(MTLGPUFamily(rawValue: 5001) ?? .common3) ? "yes" : "no")\(displays.contains(d.name) ? " · drives a display" : "")"))
     }
     if !openCLDevices.isEmpty {
         console.out("")
@@ -162,37 +257,150 @@ if options.listOnly {
     exit(0)
 }
 
+// MARK: - Environment risk assessment
+
+let risk = assessEnvironment()
+
+// MARK: - Journal
+
+var journal: Journal?
+if !options.noJournal {
+    let path = options.journalPath ?? outDir.appendingPathComponent("gpucheck-journal.log").path
+    try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+    journal = Journal(path: path)
+}
+progress.journal = journal
+journal?.log("gpucheck run start — mode=\(options.mode) intensity=\(options.intensity.rawValue) allowHeavy=\(options.allowHeavy)")
+
 // MARK: - Suite configuration
 
-var config = SuiteConfig.make(mode: options.mode)
-config.includeOpenCL = options.includeOpenCL
-config.includeRender = options.includeRender
+var config = SuiteConfig.make(mode: options.mode, intensity: options.intensity, allowHeavy: options.allowHeavy)
+config.includeOpenCL = !options.noOpenCL
+config.includeRender = !options.noRender
 if let s = options.sustainOverride {
     config.sustainedSeconds = s
-    config.includeSustained = s > 0
+    config.includeSustained = s > 0 && options.allowHeavy
 }
 if let b = options.bandwidthOverride { config.bandwidthMB = b }
 
-console.out("")
-console.out("  \(console.grey("Host"))    \(host.model) · \(host.cpu)")
-console.out("  \(console.grey("Memory"))  \(Fmt.bytes(host.memoryBytes)) · \(host.physicalCores) cores")
-console.out("  \(console.grey("OS"))      macOS \(host.osVersion) (\(host.osBuild))")
-console.out("  \(console.grey("GPUs"))    \(selectedMetal.count)" + (selectedMetal.count != allMetalDevices.count ? " of \(allMetalDevices.count) selected" : ""))
-if openCLDevices.count != allMetalDevices.count && options.includeOpenCL {
-    console.out(console.grey("  note: OpenCL reports \(openCLDevices.count) GPU device(s), Metal reports \(allMetalDevices.count)"))
-}
-console.out("  \(console.grey("Mode"))    \(config.mode)")
+// MARK: - Configuration banner
 
-// MARK: - Per-device suite
+console.out("")
+console.out("  \(console.grey("Host"))        \(host.model) · \(host.cpu)")
+console.out("  \(console.grey("Memory"))      \(Fmt.bytes(host.memoryBytes)) · \(host.physicalCores) cores")
+console.out("  \(console.grey("OS"))          macOS \(host.osVersion) (\(host.osBuild))")
+console.out("  \(console.grey("GPUs"))        \(selectedMetal.count)" + (selectedMetal.count != allMetalDevices.count ? " of \(allMetalDevices.count) selected" : ""))
+console.out("  \(console.grey("Mode"))        \(config.mode)   \(console.grey("intensity \(config.intensity.rawValue)"))")
+console.out("  \(console.grey("Workloads"))   \(Fmt.bytes(config.bandwidthMB << 20)) memory · \(Fmt.count(Double(config.computeThreads))) threads · \(config.cooldownMs) ms cooldown")
+if let j = journal {
+    console.out("  \(console.grey("Journal"))     \(j.path)")
+}
+
+if risk.hasHistory {
+    console.out("")
+    console.out("  \(console.yellow("! system stability history"))")
+    if risk.gpuResetReportCount > 0 {
+        let models = risk.resetsByModel.sorted { $0.value > $1.value }
+            .map { "\($0.key) ×\($0.value)" }.joined(separator: ", ")
+        console.out(console.grey("      GPU reset reports: \(risk.gpuResetReportCount) (\(risk.gpuResetsToday) today)\(models.isEmpty ? "" : " — \(models)")"))
+        if let last = risk.mostRecentReset {
+            console.out(console.grey("      most recent reset: \(last)"))
+        }
+    }
+    if risk.windowServerHangCount > 0 {
+        console.out(console.grey("      WindowServer hang reports: \(risk.windowServerHangCount)"))
+    }
+    if !risk.displayAttachedModels.isEmpty {
+        console.out(console.grey("      display-driving GPUs: \(risk.displayAttachedModels.sorted().joined(separator: ", "))"))
+    }
+    console.out(console.yellow("      Heavy GPU load on this machine has previously reset the GPU and hung the"))
+    console.out(console.yellow("      display. Staying at --intensity \(config.intensity.rawValue)\(config.allowHeavy ? "" : "; sustained and all-GPU tests are off")."))
+}
+if !config.allowHeavy {
+    console.out("")
+    console.out(console.grey("  Heavy tests (sustained load, simultaneous all-GPU load) are disabled. Add --allow-heavy to enable."))
+}
+
+// MARK: - Dry run
+
+if options.dryRun {
+    console.out("")
+    console.out(console.bold("Selected GPUs (\(selectedMetal.count))"))
+    for (i, d) in selectedMetal.enumerated() {
+        let tag = displayModels.contains(d.name) ? console.yellow(" · drives a display") : ""
+        console.out("  [\(i + 1)] \(d.name)  \(console.grey("registry \(d.registryID) · \(locationName(d))"))\(tag)")
+    }
+    console.out("")
+    console.out(console.bold("Planned workload"))
+    console.out("  memory working set      \(Fmt.bytes(config.bandwidthMB << 20))")
+    console.out("  compute threads         \(Fmt.count(Double(config.computeThreads)))")
+    console.out("  loop iterations         \(config.computeIters)")
+    console.out("  benchmark repetitions   \(config.attempts)")
+    console.out("  cooldown between tests  \(config.cooldownMs) ms")
+    console.out("  large-buffer test       \(config.largeBufferBytes > 0 ? Fmt.bytes(config.largeBufferBytes) : "skipped")")
+    console.out("  sustained load          \(config.includeSustained ? String(format: "%.0f s", config.sustainedSeconds) : "skipped")")
+    console.out("  multi-GPU concurrency   \(config.includeConcurrency ? "enabled" : "skipped")")
+    console.out("  OpenCL cross-check      \(config.includeOpenCL ? "enabled" : "disabled")")
+    console.out("  graphics tests          \(config.includeRender ? "enabled" : "disabled")")
+    if !config.allowHeavy {
+        console.out("")
+        console.out(console.grey("  Sustained and multi-GPU tests need --allow-heavy."))
+    }
+    console.out("")
+    exit(0)
+}
+
+// MARK: - Report scaffolding
 
 var deviceReports: [DeviceReport] = []
 var contexts: [MetalContext] = []
+var crossMeasurements: [Measurement] = []
+var crossChecks: [Check] = []
 var reportWarnings: [String] = []
-var displayAttached = false
+
+if risk.gpuResetReportCount > 0 {
+    reportWarnings.append("this system has \(risk.gpuResetReportCount) GPU reset report(s) on file (\(risk.gpuResetsToday) today); "
+        + "GPU driver resets under load are a pre-existing condition on this machine and are not necessarily caused by this run")
+}
+if risk.windowServerHangCount > 0 {
+    reportWarnings.append("\(risk.windowServerHangCount) WindowServer watchdog hang report(s) on file; heavy GPU load can starve the display compositor on this system")
+}
+if !risk.displayAttachedModels.isEmpty {
+    reportWarnings.append("displays are driven by: \(risk.displayAttachedModels.sorted().joined(separator: ", ")); brief visual stutter is expected during GPU load")
+}
+
+var reportNotes: [String] = [
+    "Every functional check compares GPU output against an independent host-side reference computed on the CPU.",
+    "Throughput figures are best-of-N repetitions to reduce noise from background activity.",
+    "Host<->device transfer figures time only the blit between system and GPU memory, so no host staging correction is needed.",
+    "The theoretical FP32 peak uses the compute-unit count and clock reported by OpenCL; Metal exposes neither.",
+    "Sustained-load tests compare the first and last quarter of a continuous run to expose thermal throttling.",
+    "Reports are written as JSON, Markdown and a self-contained HTML file.",
+    "Reports are rewritten after each GPU finishes, so a partial report survives a system hang.",
+]
+
+/// Builds the report as it currently stands, so it can be written mid-run.
+func currentReport(partial: Bool) -> RunReport {
+    var r = RunReport(timestamp: ISO8601DateFormatter().string(from: Date()),
+                      mode: config.mode,
+                      durationSeconds: nowSeconds() - runStart,
+                      host: host,
+                      devices: deviceReports,
+                      crossDeviceMeasurements: crossMeasurements,
+                      crossDeviceChecks: crossChecks,
+                      warnings: reportWarnings,
+                      notes: reportNotes)
+    r.partial = partial
+    return r
+}
+
+// MARK: - Per-device suite
 
 for (index, device) in selectedMetal.enumerated() {
     let subtitle = "\(locationName(device)) · \(Fmt.bytes(device.recommendedMaxWorkingSetSize)) · Metal 3: \(device.supportsFamily(MTLGPUFamily(rawValue: 5001) ?? .common3) ? "yes" : "no")"
+        + (risk.displayAttachedModels.contains(device.name) ? " · drives a display" : "")
     progress.beginDevice(index, total: selectedMetal.count, name: device.name, subtitle: subtitle)
+    journal?.log("DEVICE \(index + 1)/\(selectedMetal.count) \(device.name)")
 
     let ctx: MetalContext
     do {
@@ -208,15 +416,16 @@ for (index, device) in selectedMetal.enumerated() {
 
     // Feature mapping -------------------------------------------------------
     progress.beginPhase("Feature mapping")
+    progress.willRun("pixel format probe")
     progress.note("probing pixel formats and compiling shader groups…")
     let pixelFormats = probePixelFormats(device)
     ctx.calibrate()
     var sections = metalInventory(device, pixelFormats: pixelFormats)
 
-    let oclMatch = options.includeOpenCL ? matchOpenCL(device.name) : nil
+    let oclMatch = options.noOpenCL ? nil : matchOpenCL(device.name)
     if let ocl = oclMatch {
         sections.append(contentsOf: openCLSections(ocl))
-    } else if options.includeOpenCL {
+    } else if !options.noOpenCL {
         sections.append(Section(title: "OpenCL", items: [
             KV(key: "Status", value: "no matching OpenCL device for this GPU"),
         ]))
@@ -235,8 +444,7 @@ for (index, device) in selectedMetal.enumerated() {
     let clkText = oclMatch.map { "\($0.maxClockMHz) MHz" } ?? "unknown"
 
     var mapChecks: [Check] = []
-    mapChecks.append(Check(group: "Mapping", name: "GPU identity",
-                           status: .info,
+    mapChecks.append(Check(group: "Mapping", name: "GPU identity", status: .info,
                            summary: "\(device.name) at \(identity["Location"] ?? "?") · registry \(device.registryID)",
                            details: ["video memory \(memoryItems["Dedicated video memory"] ?? "?")",
                                      "max single buffer \(memoryItems["Max single buffer"] ?? "?")",
@@ -262,8 +470,7 @@ for (index, device) in selectedMetal.enumerated() {
     } else if !failedOptional.isEmpty {
         shaderSummary = "core shaders compiled; optional group(s) unavailable: \(failedOptional.map { $0.group }.joined(separator: ", "))"
     }
-    mapChecks.append(Check(group: "Mapping", name: "Shader groups compiled",
-                           status: shaderStatus,
+    mapChecks.append(Check(group: "Mapping", name: "Shader groups compiled", status: shaderStatus,
                            summary: shaderSummary,
                            details: compileReports.map { r in
                                let tag = optionalKeys.contains(r.group) ? " (optional)" : ""
@@ -274,13 +481,13 @@ for (index, device) in selectedMetal.enumerated() {
         progress.step(c.name, status: c.status, summary: c.summary)
         for d in c.details { progress.note(d) }
     }
+    rest(milliseconds: config.cooldownMs)
 
     // Functional tests ------------------------------------------------------
     let tests = FunctionalTests(ctx: ctx, config: config)
     let checks = tests.runAll(progress: progress)
 
     // Performance -----------------------------------------------------------
-    progress.beginPhase("Performance")
     let bench = Benchmarks(ctx: ctx, config: config, openCLMatch: oclMatch)
     bench.runAll(progress: progress)
     for m in bench.measurements {
@@ -290,24 +497,27 @@ for (index, device) in selectedMetal.enumerated() {
         progress.step(c.name, status: c.status, summary: c.summary, seconds: c.seconds)
     }
 
-    let deviceReport = DeviceReport(index: index + 1, name: device.name, subtitle: subtitle,
-                                    sections: sections,
-                                    checks: mapChecks + checks + bench.checks,
-                                    measurements: tests.measurements + bench.measurements)
-    if device.isHeadless == false && device.location == .slot {
-        // On a Mac Pro every MPX GPU can drive displays; note it for the report.
-        displayAttached = true
+    deviceReports.append(DeviceReport(index: index + 1, name: device.name, subtitle: subtitle,
+                                      sections: sections,
+                                      checks: mapChecks + checks + bench.checks,
+                                      measurements: tests.measurements + bench.measurements))
+
+    // Persist what we have before moving on to the next GPU.
+    do {
+        try writeReports(currentReport(partial: true), to: outDir)
+        journal?.log("partial reports written after device \(index + 1)")
+        console.out(console.grey("  partial reports written to \(outDir.path) (survives a hang)"))
+    } catch {
+        console.out(console.yellow("  could not write partial reports: \(error)"))
     }
-    deviceReports.append(deviceReport)
+    rest(milliseconds: config.cooldownMs * 2)
 }
 
 // MARK: - Multi-GPU concurrency
 
-var crossMeasurements: [Measurement] = []
-var crossChecks: [Check] = []
-
 if contexts.count > 1 && config.includeConcurrency {
     progress.beginPhase("Multi-GPU concurrency")
+    progress.willRun("multi-GPU concurrency")
     progress.note("measuring each GPU alone, then all \(contexts.count) GPUs simultaneously…")
     let outcome = MultiGPU.measure(contexts: contexts, config: config)
 
@@ -360,62 +570,38 @@ if contexts.count > 1 && config.includeConcurrency {
     for m in crossMeasurements {
         progress.measure(m.name, value: m.formatted, detail: m.notes.first)
     }
+    journal?.log("DONE   multi-GPU concurrency")
 } else if contexts.count > 1 {
-    reportWarnings.append("multi-GPU concurrency test disabled by configuration")
+    let reason = config.allowHeavy
+        ? "disabled by configuration"
+        : "skipped: requires --allow-heavy (driving every GPU at once is the highest-risk test on this class of machine)"
+    reportWarnings.append("multi-GPU concurrency test \(reason)")
+    console.out("")
+    console.out(console.grey("  multi-GPU concurrency \(reason)"))
+    journal?.log("SKIP   multi-GPU concurrency — \(reason)")
 }
 
-// MARK: - Report assembly
+// MARK: - Report assembly and output
 
-let stamp = ISO8601DateFormatter().string(from: Date())
-var report = RunReport(timestamp: stamp, mode: config.mode,
-                       durationSeconds: nowSeconds() - runStart,
-                       host: host,
-                       devices: deviceReports,
-                       crossDeviceMeasurements: crossMeasurements,
-                       crossDeviceChecks: crossChecks,
-                       warnings: reportWarnings,
-                       notes: [
-                        "Every functional check compares GPU output against an independent host-side reference computed on the CPU.",
-                        "Throughput figures are best-of-N repetitions to reduce noise from background activity.",
-                        "Host<->device transfer rates are estimates: measured host memcpy time is subtracted from the round trip.",
-                        "The theoretical FP32 peak uses the compute-unit count and clock reported by OpenCL; Metal exposes neither.",
-                        "Sustained-load tests compare the first and last quarter of a continuous run to expose thermal throttling.",
-                        "Reports are written as JSON, Markdown and a self-contained HTML file.",
-                       ])
-if displayAttached {
-    report.notes.append("At least one tested GPU also drives a display, so brief visual stutter is expected during the sustained-load phase.")
-}
-
+let report = currentReport(partial: false)
 consoleReport(report, console: console)
+journal?.log("run complete — \(report.devices.count) device(s)")
 
-// MARK: - Write outputs
-
-let outDir = URL(fileURLWithPath: options.outDir)
 do {
-    try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-    var written: [String] = []
-    if let json = jsonReport(report) {
-        let u = outDir.appendingPathComponent("gpucheck-report.json")
-        try json.write(to: u)
-        written.append(u.path)
-    }
-    let md = markdownReport(report)
-    let mdURL = outDir.appendingPathComponent("gpucheck-report.md")
-    try md.write(to: mdURL, atomically: true, encoding: .utf8)
-    written.append(mdURL.path)
-
-    let html = htmlReport(report)
-    let htmlURL = outDir.appendingPathComponent("gpucheck-report.html")
-    try html.write(to: htmlURL, atomically: true, encoding: .utf8)
-    written.append(htmlURL.path)
-
+    let written = try writeReports(report, to: outDir)
     console.header("REPORTS WRITTEN")
     for w in written { console.out("  \(console.green("\u{2713}")) \(w)") }
+    if let j = journal?.path {
+        console.out("  \(console.green("\u{2713}")) \(j)")
+    }
     console.out("")
 } catch {
     console.out(console.red("Could not write reports to \(options.outDir): \(error)"))
+    journal?.log("ERROR writing reports: \(error)")
+    journal?.close()
     exit(1)
 }
+journal?.close()
 
 let allChecks = report.devices.flatMap { $0.checks } + report.crossDeviceChecks
 exit(allChecks.contains { $0.status == .fail } ? 2 : 0)

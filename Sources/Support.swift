@@ -80,6 +80,9 @@ struct RunReport: Codable {
     var crossDeviceChecks: [Check] = []
     var warnings: [String] = []
     var notes: [String] = []
+    /// True while reports are being written mid-run; if the machine hangs, the
+    /// last partial report on disk still holds everything measured so far.
+    var partial: Bool = false
 }
 
 // MARK: - Formatting
@@ -134,6 +137,151 @@ enum Fmt {
         if s.count <= width { return s }
         return String(s.prefix(max(0, width - 1))) + "\u{2026}"
     }
+}
+
+// MARK: - Crash-resistant journal
+
+/// Appends a line to disk and fsyncs it before returning.
+///
+/// GPU work can hang a machine hard enough to require a power cycle. When that
+/// happens nothing buffered in memory survives, so each step is recorded on disk
+/// first: after a hang the journal shows exactly which test was running and
+/// which one never completed.
+final class Journal {
+    private let handle: FileHandle?
+    private let lock = NSLock()
+    private let start = Date()
+    let path: String
+
+    init(path: String) {
+        self.path = path
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        handle = FileHandle(forWritingAtPath: path)
+        handle?.seekToEndOfFile()
+    }
+
+    func log(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let handle else { return }
+        let elapsed = Date().timeIntervalSince(start)
+        let stamp = String(format: "+%8.3fs", elapsed)
+        if let data = "\(stamp)  \(message)\n".data(using: .utf8) {
+            handle.write(data)
+            // Force the record to stable storage so it survives a hard reset.
+            try? handle.synchronize()
+        }
+    }
+
+    func close() {
+        lock.lock()
+        defer { lock.unlock() }
+        try? handle?.close()
+    }
+}
+
+// MARK: - Duty cycling
+
+/// Pauses between GPU workloads.
+///
+/// On a machine whose GPUs also drive the displays, back-to-back full-load
+/// dispatches can starve WindowServer of the GPU. A short gap between tests
+/// keeps the compositor responsive at negligible cost to the measurements.
+func rest(milliseconds: Int) {
+    guard milliseconds > 0 else { return }
+    usleep(useconds_t(milliseconds) * 1000)
+}
+
+// MARK: - Environment risk assessment
+
+struct EnvironmentRisk {
+    var gpuResetReportCount = 0
+    var gpuResetsToday = 0
+    var resetsByModel: [String: Int] = [:]
+    var mostRecentReset: String?
+    var windowServerHangCount = 0
+    var displayAttachedModels: Set<String> = []
+
+    var hasHistory: Bool { gpuResetReportCount > 0 || windowServerHangCount > 0 }
+}
+
+/// Which GPU models currently drive a display, parsed from system_profiler.
+func displayAttachedGPUModels() -> Set<String> {
+    guard let text = shell("/usr/sbin/system_profiler", ["SPDisplaysDataType"]) else { return [] }
+    var attached = Set<String>()
+    var current: String?
+    var hasDisplay = false
+    func flush() {
+        if let model = current, hasDisplay { attached.insert(model) }
+        current = nil
+        hasDisplay = false
+    }
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = String(raw).trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("Chipset Model:") {
+            flush()
+            current = line.replacingOccurrences(of: "Chipset Model:", with: "").trimmingCharacters(in: .whitespaces)
+        } else if line.hasPrefix("Displays:") || line.hasPrefix("Online: Yes") {
+            hasDisplay = true
+        }
+    }
+    flush()
+    return attached
+}
+
+/// Reads the system's own GPU-reset and display-hang history.
+///
+/// A machine that has already been resetting its GPU under load is a machine
+/// where an aggressive benchmark can hang the whole system, so this history is
+/// surfaced before any heavy work is attempted.
+func assessEnvironment() -> EnvironmentRisk {
+    var risk = EnvironmentRisk()
+    let dir = "/Library/Logs/DiagnosticReports"
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd"
+    let todayPrefix = df.string(from: Date())
+
+    guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
+        risk.displayAttachedModels = displayAttachedGPUModels()
+        return risk
+    }
+
+    // The report stamps look like "Thu Sep 17 14:32:37 2026".
+    let stampFormat = DateFormatter()
+    stampFormat.locale = Locale(identifier: "en_US_POSIX")
+    stampFormat.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+    var mostRecent: Date?
+
+    for name in files {
+        if name.contains("userspace_watchdog_timeout") && name.hasSuffix(".spin") {
+            risk.windowServerHangCount += 1
+            continue
+        }
+        guard name.hasSuffix(".gpuRestart") else { continue }
+        risk.gpuResetReportCount += 1
+        if name.contains(todayPrefix) { risk.gpuResetsToday += 1 }
+        guard let text = try? String(contentsOfFile: dir + "/" + name, encoding: .utf8) else { continue }
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("Graphics Hardware:") {
+                let model = line.replacingOccurrences(of: "Graphics Hardware:", with: "").trimmingCharacters(in: .whitespaces)
+                if !model.isEmpty { risk.resetsByModel[model, default: 0] += 1 }
+            } else if line.hasPrefix("Date/Time:") {
+                let stamp = line.replacingOccurrences(of: "Date/Time:", with: "").trimmingCharacters(in: .whitespaces)
+                // Keep the genuinely latest stamp, not the last file enumerated.
+                if let date = stampFormat.date(from: stamp), mostRecent == nil || date > mostRecent! {
+                    mostRecent = date
+                    risk.mostRecentReset = stamp
+                } else if mostRecent == nil, !stamp.isEmpty {
+                    risk.mostRecentReset = stamp
+                }
+            }
+        }
+    }
+    risk.displayAttachedModels = displayAttachedGPUModels()
+    return risk
 }
 
 // MARK: - Console output
@@ -192,6 +340,7 @@ final class Console {
 /// application provides continuous feedback while a long suite is running.
 final class Progress {
     private let console: Console
+    var journal: Journal?
     private(set) var stepCount = 0
     private(set) var currentPhase = ""
     private var phaseStart = Date()
@@ -203,6 +352,7 @@ final class Progress {
     func beginPhase(_ title: String) {
         currentPhase = title
         phaseStart = Date()
+        journal?.log("PHASE  \(title)")
         console.out("")
         console.out(console.bold(console.blue("\u{25B6} " + title)))
     }
@@ -212,9 +362,16 @@ final class Progress {
         console.out("  \(console.bold("[\(index + 1)/\(total)] \(name)")) \(console.grey("(\(subtitle))"))")
     }
 
+    /// Records that a named step is about to run. If the machine dies during
+    /// this step, the journal's last line names it.
+    func willRun(_ name: String) {
+        journal?.log("START  \(name)")
+    }
+
     /// Reports a finished check with its measured duration.
     func step(_ name: String, status: Status, summary: String, seconds: Double? = nil, indent: Int = 2) {
         stepCount += 1
+        journal?.log("END    \(name)  [\(status.rawValue)] \(summary)")
         if status == .fail { failed += 1 }
         if status == .warn { warned += 1 }
         let pad = String(repeating: "  ", count: indent)
@@ -233,6 +390,7 @@ final class Progress {
     /// Reports a measurement line (a benchmark number, not a pass/fail check).
     func measure(_ name: String, value: String, detail: String? = nil, indent: Int = 2) {
         stepCount += 1
+        journal?.log("MEASURE \(name) = \(value)")
         let pad = String(repeating: "  ", count: indent)
         let label = Fmt.align(Fmt.truncate(name, 30), 30)
         var line = "\(pad)\(console.grey("\u{251C}\u{2500}")) \(console.statusColor(.info))  \(label) \(console.bold(value))"
