@@ -1,0 +1,12 @@
+# Build output
+.build/
+
+# Local probe/experiment scratch space used during development
+scratch/
+
+# Reports produced by running the tool
+gpucheck-report/
+*.report.json
+
+# macOS
+.DS_Store
