@@ -37,30 +37,39 @@ kernel void k_pattern(device float *dst [[buffer(0)]],
     dst[gid] = float(h & 0xFFFFu) * (1.0f / 65536.0f);
 }
 
+// One float4 per thread: no grid-stride loop, matching the OpenCL kernel shape.
 kernel void k_copy(device const float4 *src [[buffer(0)]],
                    device float4 *dst [[buffer(1)]],
                    constant uint &count [[buffer(2)]],
-                   uint gid [[thread_position_in_grid]],
-                   uint nthreads [[threads_per_grid]]) {
-    for (uint i = gid; i < count; i += nthreads) { dst[i] = src[i]; }
+                   uint gid [[thread_position_in_grid]]) {
+    if (gid < count) { dst[gid] = src[gid]; }
 }
 
 kernel void k_fill(device float4 *dst [[buffer(0)]],
                    constant float4 &v [[buffer(1)]],
                    constant uint &count [[buffer(2)]],
-                   uint gid [[thread_position_in_grid]],
-                   uint nthreads [[threads_per_grid]]) {
-    for (uint i = gid; i < count; i += nthreads) { dst[i] = v; }
+                   uint gid [[thread_position_in_grid]]) {
+    if (gid < count) { dst[gid] = v; }
 }
 
+// Grid-stride read with four independent accumulators so the loads are not
+// serialised by a single dependency chain.
 kernel void k_read(device const float4 *src [[buffer(0)]],
                    device float *out [[buffer(1)]],
                    constant uint &count [[buffer(2)]],
                    uint gid [[thread_position_in_grid]],
                    uint nthreads [[threads_per_grid]]) {
-    float4 acc = float4(0.0f);
-    for (uint i = gid; i < count; i += nthreads) { acc += src[i]; }
-    out[gid] = acc.x + acc.y + acc.z + acc.w;
+    float4 a0 = float4(0.0f), a1 = float4(0.0f), a2 = float4(0.0f), a3 = float4(0.0f);
+    uint i = gid;
+    for (; i + 3 * nthreads < count; i += 4 * nthreads) {
+        a0 += src[i];
+        a1 += src[i + nthreads];
+        a2 += src[i + 2 * nthreads];
+        a3 += src[i + 3 * nthreads];
+    }
+    for (; i < count; i += nthreads) { a0 += src[i]; }
+    float4 t = (a0 + a1) + (a2 + a3);
+    out[gid] = t.x + t.y + t.z + t.w;
 }
 
 // 8 independent FMA chains x float4 = 32 FMAs (64 FLOP) per loop iteration.

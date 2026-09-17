@@ -222,6 +222,21 @@ if options.skipDisplayGPUs {
     selectedMetal = kept
 }
 
+// Test GPUs that drive no display first. A display GPU is the one whose load can
+// starve WindowServer, so ordering it last means the journalled results and
+// partial reports from the safer GPUs are already on disk if it hangs the system.
+let requestedOrder = selectedMetal
+selectedMetal = selectedMetal.enumerated().sorted { a, b in
+    let aDisplay = displayModels.contains(a.element.name)
+    let bDisplay = displayModels.contains(b.element.name)
+    if aDisplay != bDisplay { return !aDisplay }
+    return a.offset < b.offset
+}.map { $0.element }
+if selectedMetal.map({ $0.registryID }) != requestedOrder.map({ $0.registryID }) {
+    console.out("")
+    console.out(console.grey("  note: reordered so non-display GPUs are tested first (a display GPU is the one that can hang the system)"))
+}
+
 var openCLDevices: [OpenCLDevice] = []
 if !options.noOpenCL {
     openCLDevices = enumerateOpenCLDevices()

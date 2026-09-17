@@ -50,11 +50,13 @@ final class Benchmarks {
             let d = Dispatch(pipeline: p, buffers: [src, dst], constantBytes: [(2, uintData([UInt32(count)]))],
                              threadgroups: gridSize(threads: count, threadsPerThreadgroup: 256),
                              threadsPerThreadgroup: tpg(256))
-            if let t = try? ctx.bestTime(d, attempts: config.attempts) {
+            if let t = try? ctx.bestTime(d, attempts: config.attempts, iterationsPerAttempt: 4) {
                 let rate = Fmt.gbs(bytes: Double(bytes) * 2, seconds: t)
                 add("Memory", "Copy bandwidth (r+w)", rate, "GB/s",
                     String(format: "%.1f GB/s", rate),
-                    notes: ["\(Fmt.bytes(bytes)) copied per iteration", "read \(Fmt.bytes(bytes)) + write \(Fmt.bytes(bytes))"])
+                    notes: ["\(Fmt.bytes(bytes)) copied per iteration", "read \(Fmt.bytes(bytes)) + write \(Fmt.bytes(bytes))",
+                            "a working set small enough to fit in an on-chip cache can inflate this above DRAM bandwidth; "
+                            + "raise --bandwidth for a DRAM-bound figure"])
             }
         }
 
@@ -65,7 +67,7 @@ final class Benchmarks {
                              constantBytes: [(1, floatData([1, 2, 3, 4])), (2, uintData([UInt32(count)]))],
                              threadgroups: gridSize(threads: count, threadsPerThreadgroup: 256),
                              threadsPerThreadgroup: tpg(256))
-            if let t = try? ctx.bestTime(d, attempts: config.attempts) {
+            if let t = try? ctx.bestTime(d, attempts: config.attempts, iterationsPerAttempt: 4) {
                 let rate = Fmt.gbs(bytes: Double(bytes), seconds: t)
                 add("Memory", "Fill bandwidth (write)", rate, "GB/s",
                     String(format: "%.1f GB/s", rate),
@@ -82,7 +84,7 @@ final class Benchmarks {
                 let d = Dispatch(pipeline: p, buffers: [src, out], constantBytes: [(2, uintData([UInt32(count)]))],
                                  threadgroups: gridSize(threads: threads, threadsPerThreadgroup: 256),
                                  threadsPerThreadgroup: tpg(256))
-                if let t = try? ctx.bestTime(d, attempts: config.attempts) {
+                if let t = try? ctx.bestTime(d, attempts: config.attempts, iterationsPerAttempt: 4) {
                     let rate = Fmt.gbs(bytes: Double(bytes), seconds: t)
                     add("Memory", "Read bandwidth (read)", rate, "GB/s",
                         String(format: "%.1f GB/s", rate),
@@ -153,8 +155,13 @@ final class Benchmarks {
                     let eff = opsPerSecond / peak * 100
                     notes.append(String(format: "theoretical peak from %d CUs @ %d MHz = %.2f TFLOP/s -> %.1f%% efficiency",
                                         openCLMatch?.computeUnits ?? 0, openCLMatch?.maxClockMHz ?? 0, peak / 1e12, eff))
-                    notes.append("the peak assumes the maximum boost clock, and at low intensity the workload may not "
-                                 + "fully saturate the GPU, so this ratio is a lower bound on real efficiency")
+                    if eff >= 98 {
+                        notes.append("measured throughput meets or exceeds the peak implied by the reported clock, so that "
+                                     + "clock is the base/default rather than the boost clock and the derived peak is too low")
+                    } else {
+                        notes.append("the peak assumes the maximum boost clock, and at low intensity the workload may not "
+                                     + "fully saturate the GPU, so this ratio is a lower bound on real efficiency")
+                    }
                     add("Compute", "FP32 peak (theoretical)", peak / 1e12, "TFLOP/s",
                         String(format: "%.2f TFLOP/s", peak / 1e12),
                         notes: ["CUs x 64 lanes x 2 FLOP x clock, using OpenCL-reported values"])
@@ -434,6 +441,32 @@ final class Benchmarks {
             checks.append(Check(group: "OpenCL", name: "OpenCL kernel build + run", status: .warn,
                                 summary: f.message,
                                 details: ["OpenCL is deprecated on macOS; Metal remains the primary path"]))
+        }
+
+        // Cross-check FP32 throughput through the second API. This separates a
+        // Metal driver limitation from a device-wide one.
+        switch openCLFMAThroughput(ocl, threads: config.computeThreads, iters: config.computeIters, iterations: 8) {
+        case .success(let c):
+            let tflops = c.flopsPerSecond / 1e12
+            var notes = ["independent OpenCL 1.2 stack, same 8-chain float4 FMA workload",
+                         String(format: "each measured dispatch ran for %.3f ms", c.seconds * 1e3)]
+            if let metal = measurements.first(where: { $0.name == "FP32 FMA" }) {
+                let ratio = metal.value > 0 ? tflops / metal.value : 0
+                notes.append(String(format: "Metal reported %.2f TFLOP/s, OpenCL %.2f TFLOP/s (OpenCL/Metal = %.2fx)",
+                                    metal.value, tflops, ratio))
+                if ratio > 1.5 {
+                    notes.append("OpenCL is substantially faster on the same workload, which points at a Metal driver limitation rather than the silicon")
+                } else if ratio < 0.67 {
+                    notes.append("Metal is substantially faster on the same workload, which points at the OpenCL driver")
+                } else {
+                    notes.append("both APIs agree, so this is the device's real FP32 throughput rather than an API artefact")
+                }
+            }
+            add("OpenCL", "OpenCL FP32 FMA", tflops, "TFLOP/s", String(format: "%.2f TFLOP/s", tflops), notes: notes)
+        case .failure(let f):
+            checks.append(Check(group: "OpenCL", name: "OpenCL FP32 cross-check", status: .warn,
+                                summary: f.message,
+                                details: ["could not compare FP32 throughput across the two APIs"]))
         }
     }
 

@@ -284,3 +284,112 @@ func openCLCopyBandwidth(_ d: OpenCLDevice, bufferBytes: Int, iterations: Int) -
         buildLog: buildLog
     ))
 }
+
+// MARK: - OpenCL compute cross-check
+
+/// Same FMA workload shape as the Metal benchmark (8 independent float4 chains),
+/// so the two APIs can be compared directly. If Metal reports much less than
+/// OpenCL on the same GPU, the limit is in the Metal driver rather than the
+/// silicon; if both agree, the device itself is delivering that throughput.
+let openCLFMASource = """
+__kernel void gpucheck_fma(__global float4 *out, const uint iters) {
+    size_t gid = get_global_id(0);
+    float4 a = (float4)(1.0000001f, 0.9999999f, 1.0000002f, 0.9999998f);
+    float4 b = (float4)(1.0e-7f, 2.0e-7f, 3.0e-7f, 4.0e-7f);
+    float base = (float)(gid & 1023u) * 1.0e-3f;
+    float4 c0 = (float4)(base, base + 0.1f, base + 0.2f, base + 0.3f);
+    float4 c1 = c0 + 0.5f, c2 = c0 + 0.7f, c3 = c0 + 0.9f;
+    float4 c4 = c0 + 1.1f, c5 = c0 + 1.3f, c6 = c0 + 1.5f, c7 = c0 + 1.7f;
+    for (uint i = 0; i < iters; ++i) {
+        c0 = fma(a, c0, b); c1 = fma(a, c1, b);
+        c2 = fma(a, c2, b); c3 = fma(a, c3, b);
+        c4 = fma(a, c4, b); c5 = fma(a, c5, b);
+        c6 = fma(a, c6, b); c7 = fma(a, c7, b);
+    }
+    out[gid] = (c0 + c1) + (c2 + c3) + (c4 + c5) + (c6 + c7);
+}
+"""
+
+struct OpenCLComputeResult {
+    var flopsPerSecond: Double
+    var seconds: Double
+    var iterations: Int
+    var buildLog: String
+}
+
+func openCLFMAThroughput(_ d: OpenCLDevice, threads: Int, iters: UInt32, iterations: Int) -> Result<OpenCLComputeResult, OpenCLFailure> {
+    var err: cl_int = 0
+    var deviceID: cl_device_id? = d.id
+    guard let context = clCreateContext(nil, 1, &deviceID, nil, nil, &err) else {
+        return .failure(OpenCLFailure(message: "clCreateContext failed: \(clErrorName(err))"))
+    }
+    defer { clReleaseContext(context) }
+    guard let queue = clCreateCommandQueue(context, d.id, 0, &err) else {
+        return .failure(OpenCLFailure(message: "clCreateCommandQueue failed: \(clErrorName(err))"))
+    }
+    defer { clReleaseCommandQueue(queue) }
+
+    var buildLog = ""
+    let source = openCLFMASource
+    let program: cl_program? = source.withCString { cstr -> cl_program? in
+        var ptr: UnsafePointer<CChar>? = cstr
+        return clCreateProgramWithSource(context, 1, &ptr, nil, &err)
+    }
+    guard let program else { return .failure(OpenCLFailure(message: "clCreateProgramWithSource failed: \(clErrorName(err))")) }
+    defer { clReleaseProgram(program) }
+
+    let buildStatus = clBuildProgram(program, 1, &deviceID, nil, nil, nil)
+    var logSize = 0
+    if clGetProgramBuildInfo(program, d.id, cl_program_build_info(CL_PROGRAM_BUILD_LOG), 0, nil, &logSize) == CL_SUCCESS, logSize > 1 {
+        var buf = [CChar](repeating: 0, count: logSize + 1)
+        if clGetProgramBuildInfo(program, d.id, cl_program_build_info(CL_PROGRAM_BUILD_LOG), logSize, &buf, nil) == CL_SUCCESS {
+            buildLog = String(cString: buf).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+    guard buildStatus == CL_SUCCESS else {
+        return .failure(OpenCLFailure(message: "OpenCL FMA kernel build failed: \(clErrorName(buildStatus))\(buildLog.isEmpty ? "" : " — \(buildLog)")"))
+    }
+    guard let kernel = clCreateKernel(program, "gpucheck_fma", &err) else {
+        return .failure(OpenCLFailure(message: "clCreateKernel failed: \(clErrorName(err))"))
+    }
+    defer { clReleaseKernel(kernel) }
+
+    let bufferBytes = threads * 16
+    guard let out = clCreateBuffer(context, cl_mem_flags(CL_MEM_WRITE_ONLY), bufferBytes, nil, &err) else {
+        return .failure(OpenCLFailure(message: "clCreateBuffer failed: \(clErrorName(err))"))
+    }
+    defer { clReleaseMemObject(out) }
+
+    var outArg: cl_mem? = out
+    var itersArg = iters
+    guard clSetKernelArg(kernel, 0, MemoryLayout<cl_mem?>.size, &outArg) == CL_SUCCESS,
+          clSetKernelArg(kernel, 1, MemoryLayout<cl_uint>.size, &itersArg) == CL_SUCCESS else {
+        return .failure(OpenCLFailure(message: "clSetKernelArg failed"))
+    }
+
+    var global = threads
+    // The global size must be a multiple of the local size.
+    var local = max(1, min(d.maxWorkGroupSize, 256))
+    while global % local != 0 && local > 1 { local /= 2 }
+
+    func enqueue() -> cl_int {
+        clEnqueueNDRangeKernel(queue, kernel, 1, nil, &global, &local, 0, nil, nil)
+    }
+    for _ in 0..<2 {
+        let e = enqueue()
+        if e != CL_SUCCESS { return .failure(OpenCLFailure(message: "clEnqueueNDRangeKernel failed: \(clErrorName(e))")) }
+    }
+    guard clFinish(queue) == CL_SUCCESS else { return .failure(OpenCLFailure(message: "clFinish after warm-up failed")) }
+
+    let start = nowSeconds()
+    for _ in 0..<iterations {
+        let e = enqueue()
+        if e != CL_SUCCESS { return .failure(OpenCLFailure(message: "clEnqueueNDRangeKernel failed: \(clErrorName(e))")) }
+    }
+    guard clFinish(queue) == CL_SUCCESS else { return .failure(OpenCLFailure(message: "clFinish failed")) }
+    let elapsed = nowSeconds() - start
+
+    let flops = Double(threads) * Double(iters) * 64.0 * Double(iterations)
+    return .success(OpenCLComputeResult(flopsPerSecond: flops / elapsed, seconds: elapsed / Double(iterations),
+                                       iterations: iterations, buildLog: buildLog))
+}

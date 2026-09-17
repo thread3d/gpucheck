@@ -864,14 +864,24 @@ final class FunctionalTests {
                          details: ["MTLIndirectCommandBuffer with concurrentDispatch, buffers bound at encode time"],
                          seconds: nowSeconds() - started)
         } catch {
-            // Distinguish "the driver refused this at execution time" from "the
-            // feature does not exist": the API is present, so a GPU command
-            // buffer failure points at the driver.
+            // The API is present and the command encodes fine, so a failure here
+            // is driver-side. A *timeout* is more serious than an internal error:
+            // the GPU failed to finish work that should take microseconds, which
+            // is the failure mode that leads to a driver reset.
+            let message = firstLine(String(describing: error))
+            let timedOut = message.lowercased().contains("timeout")
             return Check(group: "Correctness", name: "Indirect command buffer", status: .warn,
-                         summary: "ICB dispatch failed at execution: \(firstLine(String(describing: error)))",
-                         details: ["the ICB APIs are available and the command encoded successfully",
-                                   "the failure surfaced when the GPU command buffer ran, which indicates a driver-side problem",
-                                   "an internal error here is worth reporting to the vendor rather than treated as a missing feature"],
+                         summary: timedOut
+                            ? "ICB dispatch caused a GPU timeout: \(message)"
+                            : "ICB dispatch failed at execution: \(message)",
+                         details: timedOut
+                            ? ["the dispatch is a trivial 65536-thread SAXPY, so a timeout is not a workload problem",
+                               "a GPU timeout on trivial indirect work means the driver could not retire the command",
+                               "GPU timeouts are the precursor to a driver reset, and this GPU model has a reset history on this machine",
+                               "treat this as a GPU/driver fault indicator rather than a missing feature"]
+                            : ["the ICB APIs are available and the command encoded successfully",
+                               "the failure surfaced when the GPU command buffer ran, which indicates a driver-side problem",
+                               "an internal error here is worth reporting to the vendor rather than treated as a missing feature"],
                          seconds: nowSeconds() - started)
         }
     }
