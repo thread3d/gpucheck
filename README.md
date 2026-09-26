@@ -171,3 +171,7 @@ Sources/Benchmarks.swift performance measurements and multi-GPU scaling
 Sources/Report.swift     console, JSON, Markdown and HTML reports
 Sources/Support.swift    data model, journal, environment risk assessment
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
