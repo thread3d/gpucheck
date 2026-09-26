@@ -8,5 +8,11 @@ scratch/
 gpucheck-report/
 *.report.json
 
+# Local-only notes about the specific machine this was run on. Machine hardware
+# details, measured numbers and stability history belong here, never in the
+# repository.
+*.local.md
+local-notes/
+
 # macOS
 .DS_Store

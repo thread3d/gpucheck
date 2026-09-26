@@ -39,7 +39,7 @@ reports it before doing any work. If you are on an unstable machine, start with:
 
 ```sh
 ./build.sh
-./.build/gpucheck --device-name radeon --intensity safe --dry-run
+./.build/gpucheck --device-name <substring> --intensity safe --dry-run
 ```
 
 ## Build
@@ -58,7 +58,7 @@ only the Swift compiler from the Command Line Tools.
 ./.build/gpucheck --list                              # list GPUs and exit
 ./.build/gpucheck --dry-run                           # show the plan, touch nothing
 ./.build/gpucheck                                     # safe defaults, all GPUs
-./.build/gpucheck --device-name radeon --mode quick     # one GPU, shortest run
+./.build/gpucheck --device-name radeon --mode quick    # one GPU, shortest run
 ./.build/gpucheck --intensity full --allow-heavy      # full load (see safety)
 ```
 
@@ -156,6 +156,23 @@ the output directory:
   reads as ~10⁹ ULP. Accuracy is scored in ULP of each function's own output
   scale, with large-argument behaviour measured separately against the bound
   implied by float's representation.
+
+## What the tool tends to surface
+
+Every finding is measured, never hard-coded. In practice the interesting output
+is usually:
+
+- Features a GPU's Metal driver does not actually implement, even though the API
+  is present — the tool reports the driver's own error text.
+- Formats or limits that differ between GPUs that look identical on paper.
+- A GPU whose measured throughput diverges from the peak implied by its compute
+  units and clock. An OpenCL cross-check of the same workload distinguishes a
+  driver limitation from a device one: if both APIs agree, it is the hardware.
+- Pre-existing GPU driver resets or display-server hangs already on record, read
+  from the system logs before any load is applied.
+
+Reports on a specific machine are kept out of this repository; see
+`.gitignore` for the local notes pattern.
 
 ## Layout
 
